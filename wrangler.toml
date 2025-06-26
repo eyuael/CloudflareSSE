@@ -1,0 +1,17 @@
+# Cloudflare Workers Configuration
+# Server-Sent Events (SSE) Worker with Durable Objects
+
+name = "sse-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Durable Objects Configuration
+[durable_objects]
+bindings = [
+  { name = "SSE_DURABLE_OBJECT", class_name = "SseDurableObject" }
+]
+
+# Durable Objects Migration
+[[migrations]]
+tag = "v1"
+new_classes = ["SseDurableObject"]

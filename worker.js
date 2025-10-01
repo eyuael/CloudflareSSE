@@ -8,12 +8,28 @@
  * - Full CORS support for cross-origin requests
  */
 
+const corsHeaders = (options = {}) => ({
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
+  'Vary': 'Origin',
+  ...options,
+});
+
+const MAX_MESSAGES = 10;
+const MAX_CLIENT_QUEUE = 100;
+
 export class SseDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.connections = new Set();
+    this.controllers = new Set();
     this.updateInterval = null;
+    this.lastMessages = [];
+    this.ready = this.state.storage.get('lastMessages').then(messages => {
+      if (messages) {
+        this.lastMessages = messages;
+      }
+    });
   }
 
   async fetch(request) {
@@ -24,11 +40,13 @@ export class SseDurableObject {
       return this.handleCorsPreflightRequest();
     }
 
+    const room = url.searchParams.get('room') || 'global';
+
     switch (url.pathname) {
       case '/connect':
-        return this.handleSseConnection();
+        return this.handleSseConnection(room);
       case '/broadcast':
-        return this.handleBroadcast(request);
+        return this.handleBroadcast(request, room);
       default:
         return new Response('Not found', { status: 404 });
     }
@@ -39,47 +57,43 @@ export class SseDurableObject {
    */
   handleCorsPreflightRequest() {
     return new Response(null, {
-      status: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
+      status: 204,
+      headers: corsHeaders({
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
         'Access-Control-Max-Age': '86400',
-      },
+      }),
     });
   }
 
   /**
    * Handle new SSE connections
    */
-  handleSseConnection() {
-    let intervalId;
-    
+  handleSseConnection(room) {
     const stream = new ReadableStream({
-      start: (controller) => {
-        const encoder = new TextEncoder();
-        
-        // Send initial connection confirmation
-        controller.enqueue(encoder.encode('data: Connected to SSE stream\n\n'));
-        
-        // Start periodic updates
-        intervalId = setInterval(() => {
-          const data = {
-            timestamp: new Date().toISOString(),
-            connectionCount: this.connections.size,
-            durableObjectId: this.state.id.toString()
-          };
-          
-          const eventData = `event: update\ndata: ${JSON.stringify(data)}\n\n`;
-          controller.enqueue(encoder.encode(eventData));
-        }, 3000); // Send updates every 3 seconds
-      },
-      
-      cancel: () => {
-        if (intervalId) {
-          clearInterval(intervalId);
+      start: async (controller) => {
+        controller._queue = [];
+        controller._max = MAX_CLIENT_QUEUE;
+        this.controllers.add(controller);
+
+        if (this.controllers.size === 1) {
+          this.startPeriodicUpdate();
         }
-      }
+
+        const encoder = new TextEncoder();
+        this.enqueueToController(controller, encoder.encode('data: Connected to SSE stream\n\n'));
+
+        // Wait for storage to be ready and then replay last messages
+        await this.ready;
+        for (const message of this.lastMessages) {
+          this.enqueueToController(controller, encoder.encode(`event: broadcast\ndata: ${JSON.stringify(message)}\n\n`));
+        }
+      },
+      cancel: (controller) => {
+        this.controllers.delete(controller);
+        if (this.controllers.size === 0) {
+          this.stopPeriodicUpdate();
+        }
+      },
     });
 
     return new Response(stream, {
@@ -87,8 +101,7 @@ export class SseDurableObject {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Cache-Control',
+        ...corsHeaders(),
       },
     });
   }
@@ -96,71 +109,107 @@ export class SseDurableObject {
   /**
    * Handle broadcast messages to all connected clients
    */
-  async handleBroadcast(request) {
+  async handleBroadcast(request, room) {
     try {
       let message;
-      
-      // Parse request body
       const contentType = request.headers.get('content-type') || '';
+
       if (contentType.includes('application/json')) {
         const bodyText = await request.text();
-        
-        if (bodyText.trim() === '') {
-          message = { 
-            message: 'Empty broadcast', 
-            timestamp: new Date().toISOString() 
-          };
-        } else {
-          message = JSON.parse(bodyText);
-        }
+        message = bodyText.trim() === '' ? { message: 'Empty broadcast' } : JSON.parse(bodyText);
       } else {
-        message = { 
-          message: 'Non-JSON broadcast', 
-          timestamp: new Date().toISOString() 
-        };
+        message = { message: 'Non-JSON broadcast' };
       }
-      
-      // Add server timestamp if not present
+
       if (!message.timestamp) {
         message.timestamp = new Date().toISOString();
       }
-      
+
+      this.lastMessages.push(message);
+      if (this.lastMessages.length > MAX_MESSAGES) {
+        this.lastMessages.shift();
+      }
+      this.state.waitUntil(this.state.storage.put('lastMessages', this.lastMessages));
+
+      const payload = `event: broadcast\ndata: ${JSON.stringify(message)}\n\n`;
+      const encoder = new TextEncoder();
+      const encodedPayload = encoder.encode(payload);
+
+      for (const controller of this.controllers) {
+        this.enqueueToController(controller, encodedPayload);
+      }
+
       return new Response(
-        JSON.stringify({ 
-          success: true, 
-          message: 'Broadcast received successfully',
-          data: message 
-        }), 
-        { 
+        JSON.stringify({ success: true, message: 'Broadcast sent successfully' }),
+        {
           status: 200,
-          headers: this.getCorsHeaders('application/json')
+          headers: corsHeaders({ 'Content-Type': 'application/json' }),
         }
       );
-      
     } catch (error) {
       return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: error.message,
-          details: 'Failed to parse broadcast request' 
-        }), 
-        { 
-          status: 400, 
-          headers: this.getCorsHeaders('application/json')
+        JSON.stringify({ success: false, error: error.message }),
+        {
+          status: 400,
+          headers: corsHeaders({ 'Content-Type': 'application/json' }),
         }
       );
     }
   }
 
+  enqueueToController(controller, chunk) {
+    if (!this.controllers.has(controller)) {
+      return;
+    }
+    controller._queue.push(chunk);
+    if (controller._queue.length > controller._max) {
+      controller._queue.shift();
+    }
+    this.tryDrainQueue(controller);
+  }
+
+  tryDrainQueue(controller) {
+    try {
+      while (controller._queue.length > 0) {
+        controller.enqueue(controller._queue.shift());
+      }
+    } catch (error) {
+      this.controllers.delete(controller);
+    }
+  }
+
   /**
-   * Get standard CORS headers
+   * Start periodic updates to all connected clients
    */
-  getCorsHeaders(contentType = 'text/plain') {
-    return {
-      'Content-Type': contentType,
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
-    };
+  startPeriodicUpdate() {
+    this.updateInterval = setInterval(() => {
+      try {
+        const data = {
+          timestamp: new Date().toISOString(),
+          durableObjectId: this.state.id.toString(),
+        };
+
+        const eventData = `event: update\ndata: ${JSON.stringify(data)}\n\n`;
+        const encoder = new TextEncoder();
+        const encodedEventData = encoder.encode(eventData);
+
+        for (const controller of this.controllers) {
+          this.enqueueToController(controller, encodedEventData);
+        }
+      } catch (error) {
+        // Interval will continue running even if an error occurs
+      }
+    }, 3000);
+  }
+
+  /**
+   * Stop periodic updates
+   */
+  stopPeriodicUpdate() {
+    if (this.updateInterval) {
+      clearInterval(this.updateInterval);
+      this.updateInterval = null;
+    }
   }
 }
 
@@ -174,28 +223,25 @@ export default {
     // Handle CORS preflight requests at worker level
     if (request.method === 'OPTIONS') {
       return new Response(null, {
-        status: 200,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
+        status: 204,
+        headers: corsHeaders({
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Cache-Control',
           'Access-Control-Max-Age': '86400',
-        },
+        }),
       });
     }
     
     // Route SSE and broadcast requests to Durable Object
     if (url.pathname === '/connect' || url.pathname === '/broadcast') {
       try {
-        const durableObjectId = env.SSE_DURABLE_OBJECT.idFromName('sse-singleton');
+        const room = url.searchParams.get('room') || 'global';
+        const durableObjectId = env.SSE_DURABLE_OBJECT.idFromName(room);
         const durableObject = env.SSE_DURABLE_OBJECT.get(durableObjectId);
         return await durableObject.fetch(request);
       } catch (error) {
         return new Response(`Internal Server Error: ${error.message}`, { 
           status: 500,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-          }
+          headers: corsHeaders(),
         });
       }
     }
@@ -221,16 +267,14 @@ export default {
       }), {
         headers: { 
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
+          ...corsHeaders()
         }
       });
     }
     
     return new Response('Not Found', { 
       status: 404,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-      }
+      headers: corsHeaders(),
     });
   }
 };

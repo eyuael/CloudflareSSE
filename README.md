@@ -21,9 +21,12 @@ This worker uses Cloudflare's Durable Objects to manage persistent SSE connectio
 
 ## API Endpoints
 
-### `GET /connect`
+### `GET /connect?room=<room_id>`
 
-Establishes a Server-Sent Events connection.
+Establishes a Server-Sent Events connection to a specific room.
+
+**Query Parameters:**
+- `room` (optional): The ID of the room to connect to. Defaults to `global`.
 
 **Response Headers:**
 - `Content-Type: text/event-stream`
@@ -45,9 +48,12 @@ event: broadcast
 data: {"message":"Hello World","timestamp":"2025-06-26T12:01:00.000Z"}
 ```
 
-### `POST /broadcast`
+### `POST /broadcast?room=<room_id>`
 
-Sends a message to all connected SSE clients.
+Sends a message to all connected SSE clients in a specific room.
+
+**Query Parameters:**
+- `room` (optional): The ID of the room to broadcast to. Defaults to `global`.
 
 **Request Headers:**
 - `Content-Type: application/json`
@@ -160,8 +166,8 @@ intervalId = setInterval(() => {
 ### JavaScript Client
 
 ```javascript
-// Connect to SSE endpoint
-const eventSource = new EventSource('https://your-worker.workers.dev/connect');
+// Connect to SSE endpoint for a specific room
+const eventSource = new EventSource('https://your-worker.workers.dev/connect?room=my-room');
 
 // Handle connection open
 eventSource.onopen = function(event) {
@@ -189,8 +195,8 @@ eventSource.onerror = function(event) {
 ### Send Broadcast Message
 
 ```javascript
-// Send broadcast to all connected clients
-fetch('https://your-worker.workers.dev/broadcast', {
+// Send broadcast to all connected clients in a specific room
+fetch('https://your-worker.workers.dev/broadcast?room=my-room', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
@@ -208,7 +214,7 @@ fetch('https://your-worker.workers.dev/broadcast', {
 
 **Connect to SSE:**
 ```bash
-curl -N https://your-worker.workers.dev/connect
+curl -N https://your-worker.workers.dev/connect?room=my-room
 ```
 
 **Send broadcast:**
@@ -216,7 +222,7 @@ curl -N https://your-worker.workers.dev/connect
 curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"message":"Hello World","data":"Additional info"}' \
-  https://your-worker.workers.dev/broadcast
+  https://your-worker.workers.dev/broadcast?room=my-room
 ```
 
 ## Development
@@ -234,21 +240,24 @@ wrangler dev
 
 ```bash
 # Test SSE connection
-curl -N http://localhost:8787/connect
+curl -N http://localhost:8787/connect?room=my-room
 
 # Test broadcast
 curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"message":"Test message"}' \
-  http://localhost:8787/broadcast
+  http://localhost:8787/broadcast?room=my-room
 ```
 
 ## Performance Considerations
 
-- **Connection Limits**: Durable Objects can handle thousands of concurrent connections
-- **Geographic Distribution**: Connections are automatically routed to the nearest Cloudflare edge location
-- **Auto-scaling**: Cloudflare automatically scales based on demand
-- **Memory Usage**: Each connection uses minimal memory for connection state
+- **Scalability**: The worker now shards connections by room, allowing for greater scalability.
+- **Connection Limits**: Durable Objects can handle thousands of concurrent connections per room.
+- **Back-pressure**: The worker implements a per-client queue depth limit to prevent memory leaks from slow clients.
+- **Message Persistence**: The last 10 messages are persisted in Durable Object storage to survive evictions.
+- **Geographic Distribution**: Connections are automatically routed to the nearest Cloudflare edge location.
+- **Auto-scaling**: Cloudflare automatically scales based on demand.
+- **Memory Usage**: Each connection uses minimal memory for connection state.
 
 ## Security
 
@@ -310,4 +319,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-Built with ❤️ using Cloudflare Workers and Durable Objects 
+Built with ❤️ using Cloudflare Workers and Durable Objects
